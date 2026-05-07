@@ -1,14 +1,12 @@
 {
-    "name": "Template Plugin",
-    "description": "A plugin for use as a template.",
-    "authors": [
-        {
-            "name": "You!",
-            "id": "YOUR_ID_HERE"
-        }
-    ],
-    "main": "src/index.ts",
-    "vendetta": {
-        "icon": "ic_badge_staff"
+  "name": "FixInvalidMentions",
+  "description": "Fixes broken or uncached user mentions by resolving user IDs and improving how they are displayed in chat.",
+  "authors": [
+    {
+      "name": "fshin",
+      "id": "1381008677301129257"
     }
+  ],
+  "main": "./src/index.ts",
+  "version": "1.0.0"
 }
