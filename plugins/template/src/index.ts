@@ -1,12 +1,11 @@
-import { logger } from "@vendetta";
-import Settings from "./Settings";
-
 export default {
-    onLoad: () => {
-        logger.log("Hello world!");
+    name: "FixInvalidMentions",
+
+    onLoad() {
+        console.log("FixInvalidMentions loaded");
     },
-    onUnload: () => {
-        logger.log("Goodbye, world.");
-    },
-    settings: Settings,
-}
+
+    onUnload() {
+        console.log("FixInvalidMentions unloaded");
+    }
+};
