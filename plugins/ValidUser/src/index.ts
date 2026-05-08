@@ -2,66 +2,94 @@ import { findByProps, findByName } from "@vendetta/metro";
 import { before } from "@vendetta/patcher";
 import { logger } from "@vendetta";
 
-// Modules
+// ---------------------------------------------------------------------------
+// Module resolution
+// ---------------------------------------------------------------------------
+
 const UserStore = findByProps("getUser", "getUsers");
-const UserFetcher = findByProps("fetchUser");
 const FluxDispatcher = findByProps("dispatch", "subscribe");
+const UserFetcher = findByProps("fetchUser") || findByProps("getUser", "fetchProfile");
 
-const pending = new Set();
+// ---------------------------------------------------------------------------
 
-async function fetchUser(id: string) {
-    if (!id || pending.has(id) || UserStore.getUser(id)) return;
-    pending.add(id);
+const pendingFetches = new Set<string>();
 
-    try {
-        // Try internal fetcher
-        if (UserFetcher?.fetchUser) {
-            await UserFetcher.fetchUser(id);
-        } else {
-            // Manual fallback if fetcher is missing
-            const token = findByProps("getToken")?.getToken?.();
-            if (!token) return;
-            
-            const res = await fetch(`https://discord.com{id}`, {
-                headers: { Authorization: token }
-            });
-            if (res.ok) {
-                const user = await res.json();
+async function resolveUser(userId: string) {
+  if (!userId || pendingFetches.has(userId) || UserStore.getUser(userId)) return;
+
+  pendingFetches.add(userId);
+
+  try {
+    // 1. Aggressive Profile Fetch (More reliable than fetchUser)
+    if (typeof UserFetcher?.fetchProfile === "function") {
+        await UserFetcher.fetchProfile(userId);
+    } 
+    // 2. Standard User Fetch
+    else if (typeof UserFetcher?.fetchUser === "function") {
+        await UserFetcher.fetchUser(userId);
+    } 
+    // 3. API Fallback with manual Dispatch
+    else {
+        const token = findByProps("getToken")?.getToken?.();
+        if (!token) return;
+
+        const res = await fetch(`https://discord.com{userId}`, {
+            headers: { Authorization: token }
+        });
+
+        if (res.ok) {
+            const user = await res.json();
+            if (FluxDispatcher) {
                 FluxDispatcher.dispatch({ type: "USER_UPDATE", user });
             }
         }
-    } catch (e) {
-        logger.error(`[ValidUserFix] Fetch failed for ${id}`);
     }
+  } catch (err) {
+    logger.error(`[ValidUserFix] Failed to resolve ${userId}:`, err);
+  } finally {
+    // Keep in pending for 10s to prevent spamming 404s
+    setTimeout(() => pendingFetches.delete(userId), 10000);
+  }
 }
 
-let unpatch: () => void;
+// ---------------------------------------------------------------------------
+
+const patches: Array<() => void> = [];
 
 export default {
-    onLoad() {
-        // We look for 'UserMention' which is the component that handles <@id>
-        const UserMention = findByName("UserMention", false) || findByProps("UserMentionNode");
+  onLoad() {
+    // Modern Discord Mobile component for <@id> mentions
+    const MentionModule = findByName("UserMention", false) || findByProps("UserMentionNode");
 
-        if (!UserMention) {
-            return logger.error("[ValidUserFix] Could not find Mention Component");
-        }
-
-        // Patch the 'default' export or the component itself
-        const target = UserMention.default ? "default" : "UserMentionNode";
-
-        unpatch = before(target, UserMention, (args) => {
-            const props = args[0];
-            const userId = props?.userId || props?.id;
-
-            if (userId && !UserStore.getUser(userId)) {
-                fetchUser(userId);
-            }
-        });
-        
-        logger.info("[ValidUserFix] Plugin Started");
-    },
-    onUnload() {
-        unpatch?.();
-        pending.clear();
+    if (!MentionModule) {
+      logger.error("[ValidUserFix] MentionModule not found.");
+      return;
     }
-}
+
+    // Patch 'default' for functional components or 'UserMentionNode' for class-based ones
+    const patchTarget = MentionModule.default ? "default" : "UserMentionNode";
+
+    const unpatch = before(patchTarget, MentionModule, (args) => {
+      try {
+        const props = args[0];
+        const userId = props?.userId || props?.id;
+
+        if (userId && !UserStore.getUser(userId)) {
+          resolveUser(String(userId));
+        }
+      } catch (err) {
+          // Silent fail to prevent crash loops
+      }
+    });
+
+    patches.push(unpatch);
+    logger.info("[ValidUserFix] Plugin Loaded.");
+  },
+
+  onUnload() {
+    for (const unpatch of patches) unpatch();
+    patches.length = 0;
+    pendingFetches.clear();
+    logger.info("[ValidUserFix] Plugin Unloaded.");
+  },
+};
