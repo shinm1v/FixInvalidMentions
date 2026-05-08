@@ -5,71 +5,125 @@ import { logger, safeFetch, invariant } from "@lib/utils";
 const pending = new Set<string>();
 
 async function resolve(id: string) {
-    // Accessing UserStore (Lazy Proxy) triggers its internal factory automatically
     if (!id || pending.has(id) || UserStore.getUser(id)) return;
 
     pending.add(id);
 
     try {
-        // fetchProfile is the "Gold Standard" for fixing @unknown-user
-        if (UserFetcher.fetchProfile) {
+        // Best method — Discord internally fetches + caches the user
+        if (typeof UserFetcher?.fetchProfile === "function") {
             await UserFetcher.fetchProfile(id);
-        } else if (UserFetcher.fetchUser) {
+        } else if (typeof UserFetcher?.fetchUser === "function") {
             await UserFetcher.fetchUser(id);
         } else {
-            // Native API fallback using the mod's internal safeFetch utility
+            // Fallback manual request
             const token = findByProps("getToken")?.getToken?.();
 
-            if (token) {
-                await safeFetch(`https://discord.com/api/v9/users/${id}`, {
-                    headers: { Authorization: token }
-                });
+            if (!token) {
+                logger.warn(`[ValidUserFix] Missing token for ${id}`);
+                return;
             }
+
+            const res = await safeFetch(
+                `https://discord.com/api/v9/users/${id}`,
+                {
+                    headers: {
+                        Authorization: token
+                    }
+                }
+            );
+
+            if (!res.ok) {
+                logger.warn(
+                    `[ValidUserFix] Failed to fetch ${id}: ${res.status}`
+                );
+                return;
+            }
+
+            const user = await res.json();
+
+            FluxDispatcher.dispatch({
+                type: "USER_UPDATE",
+                user
+            });
         }
+
+        logger.info(`[ValidUserFix] Resolved user ${id}`);
     } catch (e) {
-        logger.error(`[ValidUserFix] Failed to resolve ${id}:`, e);
+        logger.error(`[ValidUserFix] Failed resolving ${id}:`, e);
     } finally {
-        // 15s cooldown to prevent API spamming
+        // cooldown to prevent API spam
         setTimeout(() => pending.delete(id), 15000);
     }
 }
 
-const handleEvent = (event: any) => {
-    const messages =
-        event.type === "MESSAGE_CREATE"
-            ? [event.message]
-            : event.messages;
+function extractMentions(content: string): string[] {
+    const matches = content.match(/<@!?(\d+)>/g);
+    if (!matches) return [];
 
-    if (!messages) return;
+    return matches.map(m => m.replace(/[<@!>]/g, ""));
+}
 
-    for (const msg of messages) {
-        const content = msg?.content;
+function handleEvent(event: any) {
+    try {
+        const messages =
+            event?.type === "MESSAGE_CREATE"
+                ? [event.message]
+                : event.messages;
 
-        if (typeof content === "string" && content.includes("<@")) {
-            const matches = content.match(/<@!?(\d+)>/g);
+        if (!Array.isArray(messages)) return;
 
-            matches?.forEach(m =>
-                resolve(m.replace(/[<@!>]/g, ""))
-            );
+        for (const msg of messages) {
+            const content = msg?.content;
+
+            if (typeof content !== "string") continue;
+            if (!content.includes("<@")) continue;
+
+            const ids = extractMentions(content);
+
+            for (const id of ids) {
+                if (!UserStore.getUser(id)) {
+                    resolve(id);
+                }
+            }
         }
+    } catch (e) {
+        logger.error("[ValidUserFix] Event handler error:", e);
     }
-};
+}
 
 export default {
     onLoad() {
-        invariant(FluxDispatcher, "FluxDispatcher must be available");
+        invariant(FluxDispatcher, "FluxDispatcher unavailable");
 
-        // Subscribe to Dispatcher events for high-speed mention detection
-        FluxDispatcher.subscribe("MESSAGE_CREATE", handleEvent);
-        FluxDispatcher.subscribe("LOAD_MESSAGES_SUCCESS", handleEvent);
+        FluxDispatcher.subscribe(
+            "MESSAGE_CREATE",
+            handleEvent
+        );
 
-        logger.info("[ValidUserFix] Monitoring dispatcher for unresolved mentions.");
+        FluxDispatcher.subscribe(
+            "LOAD_MESSAGES_SUCCESS",
+            handleEvent
+        );
+
+        logger.info(
+            "[ValidUserFix] Loaded and monitoring unresolved mentions."
+        );
     },
 
     onUnload() {
-        FluxDispatcher.unsubscribe("MESSAGE_CREATE", handleEvent);
-        FluxDispatcher.unsubscribe("LOAD_MESSAGES_SUCCESS", handleEvent);
+        FluxDispatcher.unsubscribe(
+            "MESSAGE_CREATE",
+            handleEvent
+        );
+
+        FluxDispatcher.unsubscribe(
+            "LOAD_MESSAGES_SUCCESS",
+            handleEvent
+        );
 
         pending.clear();
+
+        logger.info("[ValidUserFix] Unloaded.");
     }
 };
