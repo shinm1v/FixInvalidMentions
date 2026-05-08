@@ -1,162 +1,63 @@
-/**
- * ValidUserFix — Revenge plugin
- *
- * Detects unresolved <@userId> mentions, fetches missing users from Discord,
- * and injects them into UserStore so mentions become clickable.
- *
- * Original Aliucord plugin by pl.js6pak — ported to Revenge/Vendetta-style.
- */
-
 import { findByProps, findByName } from "@vendetta/metro";
 import { before } from "@vendetta/patcher";
 import { logger } from "@vendetta";
 
-// ---------------------------------------------------------------------------
-// Module resolution
-// ---------------------------------------------------------------------------
-
 const UserStore = findByProps("getUser", "getUsers");
+const FluxDispatcher = findByProps("dispatch", "subscribe");
+const UserFetcher = findByProps("fetchUser") || findByProps("getUser", "fetchProfile");
 
-const UserFetcher =
-  findByProps("fetchUser") ??
-  findByProps("getUser", "fetchProfile") ??
-  null;
+// Fallback for getting the Auth Token if internal fetchers fail
+const getToken = () => findByProps("getToken")?.getToken?.();
 
-const FluxDispatcher =
-  findByProps("dispatch", "subscribe") ??
-  findByProps("_dispatch", "subscribe") ??
-  null;
-
-const MentionModule =
-  findByProps("renderUserMention") ??
-  findByProps("UserMentionNode") ??
-  findByName("UserMentionNode", false) ??
-  null;
-
-// ---------------------------------------------------------------------------
-
-const pendingFetches = new Set<string>();
-
-// ---------------------------------------------------------------------------
+const pendingFetches = new Set();
 
 async function resolveUser(userId: string) {
-  if (!userId || pendingFetches.has(userId)) return;
+  if (!userId || pendingFetches.has(userId) || UserStore.getUser(userId)) return;
 
   pendingFetches.add(userId);
 
   try {
-    if (typeof UserFetcher?.fetchUser === "function") {
+    // 1. Try Discord's internal fetcher first (Cleanest way)
+    if (UserFetcher?.fetchUser) {
       await UserFetcher.fetchUser(userId);
-      return;
-    }
+    } 
+    // 2. Manual fallback if internal fetcher is missing
+    else {
+      const token = getToken();
+      if (!token) return;
 
-    const RestAPI =
-      findByProps("getAPIBaseURL", "userGet") ??
-      findByProps("userGet");
+      const res = await fetch(`https://discord.com{userId}`, {
+        headers: { Authorization: token }
+      });
 
-    if (typeof RestAPI?.userGet === "function") {
-      const user = await RestAPI.userGet(userId);
-
-      if (user && FluxDispatcher) {
-        FluxDispatcher.dispatch({
-          type: "USER_UPDATE",
-          user,
-        });
+      if (res.ok) {
+        const user = await res.json();
+        FluxDispatcher.dispatch({ type: "USER_UPDATE", user });
       }
-
-      return;
     }
-
-    const token = findByProps("getToken")?.getToken?.();
-
-    if (!token) {
-      logger.warn("[ValidUserFix] No auth token available — cannot fetch user", userId);
-      return;
-    }
-
-    const response = await fetch(
-      `https://discord.com/api/v9/users/${userId}`,
-      {
-        headers: { Authorization: token },
-      }
-    );
-
-    if (!response.ok) {
-      logger.warn(
-        "[ValidUserFix] Failed to fetch user:",
-        userId,
-        response.status
-      );
-      return;
-    }
-
-    const user = await response.json();
-
-    if (FluxDispatcher) {
-      FluxDispatcher.dispatch({ type: "USER_UPDATE", user });
-    }
-  } catch (err) {
-    logger.error("[ValidUserFix] Error resolving user:", userId, err);
+  } catch (e) {
+    logger.error(`[ValidUserFix] Failed for ${userId}`, e);
   } finally {
-    pendingFetches.delete(userId);
+    // Keep it in pending for a bit to avoid spamming 404s
+    setTimeout(() => pendingFetches.delete(userId), 10000);
   }
 }
 
-// ---------------------------------------------------------------------------
-
-const patches: Array<() => void> = [];
+const patches = [];
 
 export default {
   onLoad() {
-    if (!UserStore) {
-      logger.error("[ValidUserFix] UserStore not found — plugin disabled.");
-      return;
-    }
+    const MentionModule = findByProps("UserMentionNode") || findByName("UserMentionNode", false);
+    if (!MentionModule) return logger.error("MentionModule not found");
 
-    if (!MentionModule) {
-      logger.error("[ValidUserFix] MentionModule not found — plugin disabled.");
-      return;
-    }
-
-    const methodKey = MentionModule.renderUserMention
-      ? "renderUserMention"
-      : "UserMentionNode";
-
-    if (typeof (MentionModule as any)[methodKey] !== "function") {
-      logger.error("[ValidUserFix] Render method not callable — plugin disabled.");
-      return;
-    }
-
-    const unpatch = before(methodKey, MentionModule, (args: any[]) => {
-      try {
-        const ctx = args[1] ?? args[0];
-        const userId = ctx?.userId ?? ctx?.id;
-
-        if (!userId) return;
-        if (UserStore.getUser(userId)) return;
-
-        resolveUser(String(userId));
-      } catch (err) {
-        logger.error("[ValidUserFix] Error in before-hook:", err);
-      }
-    });
-
-    patches.push(unpatch);
-    logger.info("[ValidUserFix] Loaded.");
+    // Patch the component before it renders
+    patches.push(before("default", MentionModule, (args) => {
+      const id = args[0]?.userId || args[0]?.id;
+      if (id) resolveUser(id);
+    }));
   },
-
   onUnload() {
-    for (const unpatch of patches) {
-      try {
-        unpatch();
-      } catch (err) {
-        logger.error("[ValidUserFix] Error removing patch:", err);
-      }
-    }
-
-    patches.length = 0;
+    patches.forEach(unpatch => unpatch());
     pendingFetches.clear();
-
-    logger.info("[ValidUserFix] Unloaded.");
-  },
+  }
 };
