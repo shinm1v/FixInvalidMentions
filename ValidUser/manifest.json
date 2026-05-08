@@ -1,0 +1,1 @@
+{"name":"ValidUserFix","description":"Fixes invalid or uncached user mentions by resolving user IDs so they become clickable again.","authors":[{"name":"fshin","id":"1381008677301129257"}],"main":"index.js","version":"1.0.0","hash":"bdf19d5c89311e615f5fa9e5fb2700c690869a244a764aff10b26496d6c864a5"}
