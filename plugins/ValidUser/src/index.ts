@@ -1,138 +1,73 @@
-import { findByProps, findByName } from "@metro/utils";
-import { FluxDispatcher } from "@metro/common";
-import { before } from "@lib/patcher";
-import { Plugin } from "@lib/plugins";
+import { findByProps } from "@revenge-mod/metro";
+import { FluxDispatcher } from "@revenge-mod/modules/common";
 
 const UserStore = findByProps("getUser", "getCurrentUser");
-const RestAPI = findByProps("getAPIBaseURL", "get", "post") ?? findByProps("makeRequest", "get");
-const UserProfileActions = findByProps("fetchProfile", "getProfileFetching");
+const RestAPI = findByProps("getAPIBaseURL", "get", "post");
 
-const MENTION_RE = /<@!?(\d{17,20})>/g;
-const fetched = new Set<string>();
-const pending = new Set<string>();
+async function resolveAndPatch(message: any) {
+    const mentions: any[] = message.mentions ?? [];
 
-function extractMentionedIds(content: string): string[] {
-    const ids: string[] = [];
-    let match: RegExpExecArray | null;
-    MENTION_RE.lastIndex = 0;
-    while ((match = MENTION_RE.exec(content)) !== null) {
-        ids.push(match[1]);
-    }
-    return ids;
-}
+    for (const mention of mentions) {
+        const id = mention.id;
 
-function isUserCached(id: string): boolean {
-    const user = UserStore?.getUser(id);
-    return !!(user && user.username);
-}
+        // already cached with a real name
+        if (UserStore?.getUser(id)?.username) continue;
 
-const delay = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
-
-async function resolveUser(id: string): Promise<void> {
-    if (fetched.has(id) || pending.has(id)) return;
-    if (isUserCached(id)) { fetched.add(id); return; }
-
-    pending.add(id);
-    try {
-        if (UserProfileActions?.fetchProfile) {
-            await UserProfileActions.fetchProfile(id);
-        } else {
+        try {
             const res = await RestAPI.get({ url: `/users/${id}` });
-            if (res?.body) {
-                FluxDispatcher.dispatch({ type: "USER_UPDATE", user: res.body });
-            }
-        }
-        fetched.add(id);
-    } catch (e) {
-        console.warn(`[ResolveMentions] Could not fetch user ${id}:`, e);
-    } finally {
-        pending.delete(id);
-    }
-}
+            const user = res?.body;
+            if (!user) continue;
 
-async function resolveUnknownMentions(ids: string[]): Promise<void> {
-    const unknown = ids.filter(id => !isUserCached(id) && !fetched.has(id) && !pending.has(id));
-    for (let i = 0; i < unknown.length; i++) {
-        if (i > 0) await delay(150);
-        resolveUser(unknown[i]);
+            // patch the mention inside the message object directly
+            mention.username = user.username;
+            mention.discriminator = user.discriminator;
+            mention.avatar = user.avatar;
+            mention.global_name = user.global_name ?? user.username;
+
+        } catch (e) {
+            console.warn(`[ResolveMentions] fetch failed for ${id}:`, e);
+        }
     }
+
+    // force Discord to re-render the message with updated mention data
+    FluxDispatcher.dispatch({
+        type: "MESSAGE_UPDATE",
+        message: {
+            ...message,
+            mentions,
+        },
+        // Discord needs these to locate the message
+        channelId: message.channel_id,
+    });
 }
 
 export default {
-    patches: [] as any[],
-    _unpatchers: [] as (() => void)[],
-
     start() {
         this._onMessage = (payload: any) => {
-            try {
-                const content: string = payload?.message?.content ?? "";
-                const fromArray: string[] = payload?.message?.mentions?.map((u: any) => u.id) ?? [];
-                const fromContent = extractMentionedIds(content);
-                const allIds = [...new Set([...fromArray, ...fromContent])];
-                if (allIds.length > 0) resolveUnknownMentions(allIds);
-            } catch (e) {
-                console.warn("[ResolveMentions] MESSAGE_CREATE handler error:", e);
-            }
+            const msg = payload?.message;
+            if (!msg) return;
+
+            const hasUnknown = (msg.mentions ?? []).some(
+                (u: any) => !u.username
+            );
+            if (hasUnknown) resolveAndPatch(msg);
         };
 
-        this._onLoadMessages = (payload: any) => {
-            try {
-                const messages: any[] = payload?.messages ?? [];
-                const ids = new Set<string>();
-                for (const msg of messages) {
-                    (msg.mentions ?? []).forEach((u: any) => ids.add(u.id));
-                    extractMentionedIds(msg.content ?? "").forEach(id => ids.add(id));
-                }
-                if (ids.size > 0) resolveUnknownMentions([...ids]);
-            } catch (e) {
-                console.warn("[ResolveMentions] LOAD_MESSAGES_SUCCESS handler error:", e);
+        this._onLoad = (payload: any) => {
+            for (const msg of payload?.messages ?? []) {
+                const hasUnknown = (msg.mentions ?? []).some(
+                    (u: any) => !u.username
+                );
+                if (hasUnknown) resolveAndPatch(msg);
             }
         };
 
         FluxDispatcher.subscribe("MESSAGE_CREATE", this._onMessage);
-        FluxDispatcher.subscribe("LOAD_MESSAGES_SUCCESS", this._onLoadMessages);
-        this._patchMentionPress();
-    },
-
-    _patchMentionPress() {
-        const candidates = [
-            findByName("UserMention", { default: true }),
-            findByProps("handleUserMentionPress"),
-            findByProps("onUserMentionPress"),
-        ].filter(Boolean);
-
-        for (const mod of candidates) {
-            const target = mod.default ?? mod;
-            const key = typeof target === "function" ? null
-                      : (target.handleUserMentionPress ? "handleUserMentionPress"
-                       : target.onUserMentionPress     ? "onUserMentionPress"
-                       : null);
-
-            if (!key && typeof target !== "function") continue;
-
-            try {
-                const unpatch = before(
-                    key ?? "__call__",
-                    key ? target : { __call__: target },
-                    (args: any[]) => {
-                        const id = typeof args[0] === "string" ? args[0]
-                                 : args[0]?.userId ?? args[0]?.id;
-                        if (id && !isUserCached(id)) resolveUser(id);
-                    }
-                );
-                this._unpatchers.push(unpatch);
-            } catch (e) {
-                console.warn("[ResolveMentions] Could not patch mention press:", e);
-            }
-        }
+        FluxDispatcher.subscribe("LOAD_MESSAGES_SUCCESS", this._onLoad);
     },
 
     stop() {
         FluxDispatcher.unsubscribe("MESSAGE_CREATE", this._onMessage);
-        FluxDispatcher.unsubscribe("LOAD_MESSAGES_SUCCESS", this._onLoadMessages);
-        this._unpatchers.forEach(u => u?.());
-        this._unpatchers = [];
-        fetched.clear();
-        pending.clear();
+        FluxDispatcher.unsubscribe("LOAD_MESSAGES_SUCCESS", this._onLoad);
     },
-} satisfies Plugin;
+};
